@@ -537,12 +537,27 @@ class ChatApp {
     }
 
     /**
-     * Compress audio using the Web Audio API:
-     *  1. Decode original → AudioBuffer (PCM)
-     *  2. Down-sample to 22 050 Hz (halves data)
-     *  3. Mix to mono (halves data again)
-     *  4. Re-encode to WAV (lossless container of the lossy-downsampled PCM)
-     *  5. Compute audio loss metrics: SNR, dynamic-range loss, spectral centroid shift, RMS diff
+     * Full audio compression + decompression pipeline.
+     *
+     * ┌─────────────────────────────────────────────────────────────────┐
+     * │ COMPRESSION                                                     │
+     * │  Original file → decode PCM → mono + downsample → Opus @ low   │
+     * │  bitrate  →  compressedBlob  (genuinely smaller, lossy codec)   │
+     * ├─────────────────────────────────────────────────────────────────┤
+     * │ DECOMPRESSION                                                   │
+     * │  compressedBlob → decode PCM → upsample to original SR →       │
+     * │  re-encode Opus at TARGET bitrate ≈ original bitrate            │
+     * │  → decompressedBlob  (≈ same size as original, same codec)      │
+     * ├─────────────────────────────────────────────────────────────────┤
+     * │ METRICS  (PCM domain, original mono vs decompressed mono)       │
+     * │  SNR · RMS error % · Dynamic range preserved · Centroid shift   │
+     * └─────────────────────────────────────────────────────────────────┘
+     *
+     * KEY INSIGHT: "Decompression" does NOT mean raw PCM/WAV.
+     * It means recovering a compressed audio file whose size is close to
+     * the original. We achieve this by re-encoding at the ORIGINAL BITRATE
+     * using the same Opus codec, so the decompressed file is playable and
+     * approximately the same byte count as what the user uploaded.
      */
     async compressAndPrepareAudio(file) {
         try {
@@ -556,29 +571,30 @@ class ChatApp {
 
             const originalMime = file.type || 'audio/mpeg';
             const originalArrayBuffer = await this.readFileAsArrayBuffer(file);
-
-            // ── 1. Decode to PCM via Web Audio API ──────────────────────
             const AudioCtx = window.AudioContext || window.webkitAudioContext;
-            const offlineCtx = new AudioCtx({ sampleRate: 44100 });
+
+            // ── 1. Decode original → PCM ──────────────────────────────────
+            const decodeCtx = new AudioCtx();
             let originalBuffer;
             try {
-                originalBuffer = await offlineCtx.decodeAudioData(originalArrayBuffer.slice(0));
+                originalBuffer = await decodeCtx.decodeAudioData(originalArrayBuffer.slice(0));
             } catch (e) {
-                alert('Could not decode audio file. Please try a different format (MP3, WAV, OGG, FLAC).');
+                decodeCtx.close();
+                alert('Could not decode audio file. Please try MP3, WAV, OGG, or FLAC.');
                 return null;
             }
+            decodeCtx.close();
 
             const originalSampleRate = originalBuffer.sampleRate;
             const originalChannels   = originalBuffer.numberOfChannels;
             const originalSamples    = originalBuffer.length;
             const durationSec        = originalBuffer.duration;
 
-            // ── 2. Compress: downsample to 22050 Hz + mono ───────────────
-            const targetSampleRate = 22050;
-            const ratio            = targetSampleRate / originalSampleRate;
-            const compressedLength = Math.floor(originalSamples * ratio);
+            // Estimate original bitrate from file size and duration.
+            // bits = bytes × 8; bitrate = bits / seconds
+            const originalBitrate = Math.round((originalSize * 8) / durationSec);
 
-            // Mix channels to mono first
+            // ── 2. Build mono PCM at original SR (for loss metrics later) ─
             const monoOriginal = new Float32Array(originalSamples);
             for (let ch = 0; ch < originalChannels; ch++) {
                 const chData = originalBuffer.getChannelData(ch);
@@ -587,65 +603,170 @@ class ChatApp {
                 }
             }
 
-            // Linear interpolation downsample
-            const compressedPCM = new Float32Array(compressedLength);
-            for (let i = 0; i < compressedLength; i++) {
-                const srcIdx = i / ratio;
-                const lo = Math.floor(srcIdx);
+            // ── 3. Downsample to 22 050 Hz for compression ────────────────
+            const compressSR    = 22050;
+            const downRatio     = compressSR / originalSampleRate;
+            const compressLen   = Math.floor(originalSamples * downRatio);
+            const compressedPCM = new Float32Array(compressLen);
+            for (let i = 0; i < compressLen; i++) {
+                const s  = i / downRatio;
+                const lo = Math.floor(s);
                 const hi = Math.min(lo + 1, originalSamples - 1);
-                const t  = srcIdx - lo;
-                compressedPCM[i] = monoOriginal[lo] * (1 - t) + monoOriginal[hi] * t;
+                compressedPCM[i] = monoOriginal[lo] * (1 - (s - lo)) + monoOriginal[hi] * (s - lo);
             }
 
-            // ── 3. Encode compressed PCM → WAV blob/dataURL ──────────────
-            const compressedWav     = this._pcmToWav(compressedPCM, targetSampleRate);
-            const compressedDataUrl = this._arrayBufferToDataUrl(compressedWav, 'audio/wav');
-            const compressedSize    = compressedWav.byteLength;
+            // ── 4. Compress → Opus at LOW bitrate (e.g. 24 kbps) ─────────
+            // Compression bitrate is well below original so the file is smaller.
+            const compressBitrate = Math.min(24000, Math.round(originalBitrate * 0.25));
+            const compressedBlob  = await this._pcmToOpusBlob(compressedPCM, compressSR, compressBitrate);
+            const compressedSize  = compressedBlob.size;
+            const compressedDataUrl = await this._blobToDataUrl(compressedBlob);
 
-            // ── 4. Decompress: upsample back to original sample rate ──────
-            const decompressedLength = originalSamples;
-            const upsampleRatio      = originalSampleRate / targetSampleRate;
-            const decompressedPCM    = new Float32Array(decompressedLength);
+            // ── 5. DECOMPRESS ─────────────────────────────────────────────
+            // Step A: decode compressed Opus blob back to PCM
+            const compAB      = await compressedBlob.arrayBuffer();
+            const decompCtx   = new AudioCtx();
+            let   decompBuf;
+            try {
+                decompBuf = await decompCtx.decodeAudioData(compAB);
+            } catch (_) {
+                decompBuf = null;   // browser couldn't re-decode — use PCM fallback
+            }
+            decompCtx.close();
 
-            for (let i = 0; i < decompressedLength; i++) {
-                const srcIdx = i / upsampleRatio;
-                const lo = Math.floor(srcIdx);
-                const hi = Math.min(lo + 1, compressedLength - 1);
-                const t  = srcIdx - lo;
-                decompressedPCM[i] = compressedPCM[lo] * (1 - t) + compressedPCM[hi] * t;
+            // Step B: get mono PCM from decoded-back Opus, upsample to original SR
+            let restoredMono;
+            if (decompBuf) {
+                const srcMono  = decompBuf.getChannelData(0);
+                const upRatio  = originalSampleRate / decompBuf.sampleRate;
+                restoredMono   = new Float32Array(originalSamples);
+                for (let i = 0; i < originalSamples; i++) {
+                    const s  = i / upRatio;
+                    const lo = Math.floor(s);
+                    const hi = Math.min(lo + 1, srcMono.length - 1);
+                    restoredMono[i] = srcMono[lo] * (1 - (s - lo)) + srcMono[hi] * (s - lo);
+                }
+            } else {
+                // Fallback: upsample compressedPCM without codec round-trip
+                restoredMono = new Float32Array(originalSamples);
+                const upRatio = originalSampleRate / compressSR;
+                for (let i = 0; i < originalSamples; i++) {
+                    const s  = i / upRatio;
+                    const lo = Math.floor(s);
+                    const hi = Math.min(lo + 1, compressLen - 1);
+                    restoredMono[i] = compressedPCM[lo] * (1 - (s - lo)) + compressedPCM[hi] * (s - lo);
+                }
             }
 
-            const decompressedWav     = this._pcmToWav(decompressedPCM, originalSampleRate);
-            const decompressedDataUrl = this._arrayBufferToDataUrl(decompressedWav, 'audio/wav');
-            const decompressedSize    = decompressedWav.byteLength;
+            // Step C: re-encode the restored PCM at the ORIGINAL bitrate using Opus.
+            // This is what "decompression" means: recover a compressed audio file
+            // whose size and quality approximate the original, not raw PCM.
+            // We target the original bitrate but cap at 128 kbps (Opus quality ceiling).
+            const decompBitrate    = Math.min(originalBitrate, 128000);
+            const decompressedBlob = await this._pcmToOpusBlob(restoredMono, originalSampleRate, decompBitrate);
+            const decompressedSize = decompressedBlob.size;
+            const decompressedDataUrl = await this._blobToDataUrl(decompressedBlob);
 
-            // ── 5. Audio loss metrics ─────────────────────────────────────
-            const lossMetrics = this.calculateAudioLoss(monoOriginal, decompressedPCM);
+            // ── 6. Loss metrics (PCM domain: original mono vs restored mono) ──
+            const lossMetrics = this.calculateAudioLoss(monoOriginal, restoredMono);
 
             return {
                 username: this.username,
                 text: file.name,
                 timestamp: new Date().toLocaleTimeString(),
                 own: true,
-                audioUrl: compressedDataUrl,
-                decompressedAudioUrl: decompressedDataUrl,
+                audioUrl:             compressedDataUrl,    // small Opus — compressed
+                decompressedAudioUrl: decompressedDataUrl,  // Opus @ orig bitrate — decompressed
                 audioName: file.name,
                 audioMime: originalMime,
+                compressedMime:   compressedBlob.type   || 'audio/webm',
+                decompressedMime: decompressedBlob.type || 'audio/webm',
                 originalSize,
                 compressedSize,
                 decompressedSize,
                 originalSampleRate,
-                targetSampleRate,
+                compressSR,
                 originalChannels,
+                originalBitrate,
+                compressBitrate,
+                decompBitrate,
                 durationSec: parseFloat(durationSec.toFixed(2)),
                 maxUploadSize: maxSize,
                 lossMetrics
             };
         } catch (error) {
             console.error('Audio compression failed:', error);
-            alert('Unable to compress and send this audio file.');
+            alert('Unable to process this audio file. Your browser may not support MediaRecorder/Opus.');
             return null;
         }
+    }
+
+    /**
+     * Encode a Float32Array of mono PCM into a WebM/Opus or OGG/Opus blob
+     * via MediaRecorder at the specified bitrate.
+     *
+     * @param {Float32Array} pcmData   - mono PCM samples in [-1, 1]
+     * @param {number}       sampleRate - sample rate in Hz
+     * @param {number}       bitrate    - target bits per second (e.g. 24000, 96000)
+     */
+    _pcmToOpusBlob(pcmData, sampleRate, bitrate) {
+        return new Promise((resolve, reject) => {
+            const AudioCtx = window.AudioContext || window.webkitAudioContext;
+            const ctx = new AudioCtx({ sampleRate });
+
+            const audioBuffer = ctx.createBuffer(1, pcmData.length, sampleRate);
+            audioBuffer.copyToChannel(pcmData, 0);
+
+            const dest   = ctx.createMediaStreamDestination();
+            const source = ctx.createBufferSource();
+            source.buffer = audioBuffer;
+            source.connect(dest);
+
+            const mimeTypes = [
+                'audio/webm;codecs=opus',
+                'audio/ogg;codecs=opus',
+                'audio/webm',
+                'audio/ogg'
+            ];
+            const mimeType = mimeTypes.find(m => MediaRecorder.isTypeSupported(m)) || '';
+
+            const recorder = new MediaRecorder(dest.stream, {
+                mimeType: mimeType || undefined,
+                audioBitsPerSecond: bitrate
+            });
+
+            const chunks = [];
+            recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
+            recorder.onstop = () => {
+                ctx.close();
+                resolve(new Blob(chunks, { type: mimeType || 'audio/webm' }));
+            };
+            recorder.onerror = e => { ctx.close(); reject(e); };
+
+            recorder.start(100); // collect in 100ms chunks for reliability
+            source.start(0);
+
+            source.onended = () => setTimeout(() => {
+                if (recorder.state !== 'inactive') recorder.stop();
+            }, 200);
+
+            // Hard timeout: duration + 3 s buffer
+            setTimeout(() => {
+                if (recorder.state !== 'inactive') recorder.stop();
+            }, (pcmData.length / sampleRate) * 1000 + 3000);
+        });
+    }
+
+    /**
+     * Convert a Blob to a base64 data URL.
+     */
+    _blobToDataUrl(blob) {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload  = () => resolve(reader.result);
+            reader.onerror = reject;
+            reader.readAsDataURL(blob);
+        });
     }
 
     /**
@@ -840,27 +961,58 @@ class ChatApp {
         const decompVsOrigPct = m.originalSize && m.decompressedSize
             ? Math.round((1 - m.decompressedSize / m.originalSize) * 100) : null;
 
-        const snr = metrics.snrDb != null ? (Number.isFinite(metrics.snrDb) ? `${metrics.snrDb} dB` : '∞ dB') : 'N/A';
-        const rmsErr = metrics.rmsErrorPct != null ? `${metrics.rmsErrorPct}%` : 'N/A';
+        const fmt = (n, unit) => n != null ? `${n} ${unit}` : 'N/A';
+        const snr      = metrics.snrDb != null ? (Number.isFinite(metrics.snrDb) ? `${metrics.snrDb} dB` : '∞ dB') : 'N/A';
+        const rmsErr   = metrics.rmsErrorPct   != null ? `${metrics.rmsErrorPct}%` : 'N/A';
         const dynRange = metrics.dynRangePreservedPct != null ? `${metrics.dynRangePreservedPct}%` : 'N/A';
         const centShift = metrics.centroidShiftHz != null ? `${metrics.centroidShiftHz} bins` : 'N/A';
-        const maxUp = m.maxUploadSize ? this.formatBytes(m.maxUploadSize) : 'N/A';
+        const maxUp    = m.maxUploadSize ? this.formatBytes(m.maxUploadSize) : 'N/A';
+
+        const fmtBitrate = bps => bps ? `${Math.round(bps / 1000)} kbps` : 'N/A';
+        const origBR  = fmtBitrate(m.originalBitrate);
+        const compBR  = fmtBitrate(m.compressBitrate);
+        const decompBR = fmtBitrate(m.decompBitrate);
+
+        const decompColor = decompVsOrigPct != null
+            ? (Math.abs(decompVsOrigPct) <= 15 ? '#2a9d5c' : '#e07b00') : '#888';
 
         return `
             <strong>${m.audioName || 'Audio'}</strong> &nbsp;·&nbsp; ${m.durationSec}s &nbsp;·&nbsp;
-            ${m.originalSampleRate} Hz → ${m.targetSampleRate} Hz &nbsp;·&nbsp;
-            ${m.originalChannels === 1 ? 'Mono' : `${m.originalChannels}ch → Mono`}<br/>
-            <div class="audio-meta-grid" style="display:grid;grid-template-columns:auto auto auto;gap:2px 12px;margin-top:4px;">
-                <span>📦 Original</span><span>→</span><span>${this.formatBytes(m.originalSize)}</span>
-                <span>🗜️ Compressed</span><span>→</span><span>${this.formatBytes(m.compressedSize)}${compPct != null ? `&nbsp;<em style="color:#e07b00">(−${compPct}%)</em>` : ''}</span>
-                <span>♻️ Decompressed</span><span>→</span><span>${this.formatBytes(m.decompressedSize)}${decompVsOrigPct != null ? `&nbsp;<em style="color:#2a9d5c">(${decompVsOrigPct >= 0 ? '−' : '+'}${Math.abs(decompVsOrigPct)}% vs orig)</em>` : ''}</span>
+            ${m.originalSampleRate} Hz ${m.originalChannels > 1 ? `${m.originalChannels}ch` : 'mono'} &nbsp;·&nbsp;
+            orig: <em style="color:#6c63ff">${origBR}</em><br/>
+            <div style="display:grid;grid-template-columns:auto auto auto;gap:2px 12px;margin-top:5px;font-size:11.5px;">
+                <span>📦 Original</span><span>→</span>
+                <span>${this.formatBytes(m.originalSize)} @ ${origBR}</span>
+
+                <span>🗜️ Compressed</span><span>→</span>
+                <span>${this.formatBytes(m.compressedSize)} @ ${compBR}
+                    ${compPct != null ? `<em style="color:#e07b00"> (−${compPct}%)</em>` : ''}
+                    <span style="font-size:10px;color:#888"> · ${m.compressedMime || 'Opus'} · 22 050 Hz mono</span>
+                </span>
+
+                <span>♻️ Decompressed</span><span>→</span>
+                <span>${this.formatBytes(m.decompressedSize)} @ ${decompBR}
+                    ${decompVsOrigPct != null
+                        ? `<em style="color:${decompColor}"> (${decompVsOrigPct >= 0 ? '−' : '+'}${Math.abs(decompVsOrigPct)}% vs orig)</em>`
+                        : ''}
+                    <span style="font-size:10px;color:#888"> · ${m.decompressedMime || 'Opus'} · ${m.originalSampleRate} Hz</span>
+                </span>
             </div>
-            <div class="audio-loss-grid" style="display:grid;grid-template-columns:auto 1fr;gap:2px 8px;margin-top:6px;">
-                <span>📶 SNR</span><span>${snr} <em style="color:#888;font-size:11px">(higher = less noise)</em></span>
-                <span>📉 RMS error</span><span>${rmsErr} <em style="color:#888;font-size:11px">(lower = more faithful)</em></span>
-                <span>🔊 Dynamic range preserved</span><span>${dynRange}</span>
-                <span>🎵 Spectral centroid shift</span><span>${centShift} <em style="color:#888;font-size:11px">(brightness change)</em></span>
-                <span>📁 Max upload size</span><span>${maxUp}</span>
+            <div style="display:grid;grid-template-columns:auto 1fr;gap:2px 10px;margin-top:7px;font-size:11.5px;">
+                <span>📶 SNR</span>
+                <span>${snr} <em style="color:#888;font-size:10.5px">(higher = cleaner; &gt;20 dB is good)</em></span>
+
+                <span>📉 RMS error</span>
+                <span>${rmsErr} <em style="color:#888;font-size:10.5px">(lower = more faithful)</em></span>
+
+                <span>🔊 Dynamic range</span>
+                <span>${dynRange} preserved</span>
+
+                <span>🎵 Spectral shift</span>
+                <span>${centShift} <em style="color:#888;font-size:10.5px">(brightness change)</em></span>
+
+                <span>📁 Max upload</span>
+                <span>${maxUp}</span>
             </div>
         `;
     }
