@@ -1,0 +1,27 @@
+[
+  {
+    "title": "Product Plans",
+    "keywords": ["pricing", "plans", "cost", "price", "subscription"],
+    "answer": "We offer three pricing plans: Basic at $10 per month, Pro at $25 per month, and Enterprise at $60 per month. Each tier provides increasing storage capacity and customer support levels."
+  },
+  {
+    "title": "Support Hours",
+    "keywords": ["support", "help", "hours", "availability", "service hours"],
+    "answer": "Our support team is available Monday through Friday from 9 AM to 6 PM local time. Enterprise plan subscribers receive priority response for urgent issues."
+  },
+  {
+    "title": "Feature Summary",
+    "keywords": ["features", "capabilities", "what can it do", "functionality"],
+    "answer": "Our platform includes features such as instant messaging, file sharing, searchable conversation history, and basic analytics for user activity."
+  },
+  {
+    "title": "Account Reset",
+    "keywords": ["reset password", "password", "forgot", "account reset", "unlock account"],
+    "answer": "To reset your password, please follow the reset process: check your email for a temporary verification code, then create a new secure password."
+  },
+  {
+    "title": "Privacy Policy",
+    "keywords": ["privacy", "data", "database", "security", "local dataset"],
+    "answer": "Your data is stored securely and locally. We do not make external calls or share information outside of our secure environment."
+  }
+]
